@@ -14,12 +14,12 @@ def plot_protons():
     set_axes(ax, xlabel=XLABEL, ylabel=YLABEL, xlim=[1e2, 1e6], ylim=[1e3, 22e3], xscale='log', yscale='linear')
     ax.ticklabel_format(axis='y', style='sci', scilimits=(3,3))
 
-    plot_data(ax, 'PAMELA_H_energy.txt', 2.7, 1., 'o', 'tab:olive', 'PAMELA', 1)
-    plot_data(ax, 'AMS-02_H_energy.txt', 2.7, 1., 'o', 'tab:green', 'AMS-02', 2)
-    plot_data(ax, 'DAMPE_H_energy.txt', 2.7, 1., 'o', 'tab:red', 'DAMPE', 3)
-    plot_data(ax, 'CALET_H_energy.txt', 2.7, 1., 'o', 'tab:orange', 'CALET', 4)
-    plot_data(ax, 'CREAM_H_energy.txt', 2.7, 1., 'o', 'tab:purple', 'CREAM', 5)
-    plot_data(ax, 'ISS-CREAM_H_energy.txt', 2.7, 1., 'o', 'tab:blue', 'ISS-CREAM', 6)
+    #plot_data(ax, 'PAMELA_H_energy.txt', 2.7, 1., 'o', 'tab:olive', 'PAMELA', 1)
+    #plot_data(ax, 'AMS-02_H_energy.txt', 2.7, 1., 'o', 'tab:green', 'AMS-02', 2)
+    plot_data_statonly(ax, 'DAMPE_H_energy.txt', 2.7, 1., 'o', 'tab:red', 'DAMPE', 3)
+    plot_data_statonly(ax, 'CALET_H_energy.txt', 2.7, 1., 'o', 'tab:orange', 'CALET', 4)
+    #plot_data(ax, 'CREAM_H_energy.txt', 2.7, 1., 'o', 'tab:purple', 'CREAM', 5)
+    #plot_data(ax, 'ISS-CREAM_H_energy.txt', 2.7, 1., 'o', 'tab:blue', 'ISS-CREAM', 6)
     #plot_data(ax, 'kiss_tables/NUCLEON_H_totalEnergy.txt', 2.7, 1., 'o', 'tab:gray', 'NUCLEON', 1)
 
     ax.annotate(r'$E = 0.5$ TeV',xy=(5e2, 12e3),xytext=(5e2, 13.5e3),
@@ -62,6 +62,6 @@ def plot_he_spectrum():
  
 if __name__== "__main__":
     plot_protons()
-    plot_he_spectrum()
+    #plot_he_spectrum()
 
     #plot_lnA_dataonly()
