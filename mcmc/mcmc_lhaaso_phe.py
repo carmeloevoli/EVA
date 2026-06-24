@@ -10,13 +10,13 @@ so the three breaks sit at the same *rigidity* for both, i.e. at 2x the energy
 for helium.  The model is constrained simultaneously by:
 
     * the proton measurement   I_H            (DAMPE, CALET, CREAM, LHAASO)
-    * the helium measurement   I_He           (DAMPE, CALET)
-    * the light measurement    I_H + I_He     (LHAASO)
+    * the light measurement    I_H + I_He     (DAMPE, CALET, LHAASO)
 
 Energy-scale nuisances are per experiment (shared across observables), DAMPE =
 reference.  Statistical errors remain independent; systematic errors are
-correlated within energy blocks and between H/He for DAMPE and H/H+He for
-LHAASO.
+correlated within energy blocks for each observable.  DAMPE and LHAASO H and
+H+He are not cross-correlated.  CALET H+He is reconstructed from its H and He
+tables, so its covariance with the reused H measurements is retained.
 
 Run with:  python mcmc_lhaaso_phe.py
 """
@@ -35,7 +35,7 @@ import emcee
 import kiss_reader
 from sbpl import sbpl
 
-NCORES = 16
+NCORES = 10
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,25 +44,28 @@ NCORES = 16
 # Proton measurement: (label, kiss_reader experiment).
 H_DATASETS = [("DAMPE", "DAMPE"), ("CALET", "CALET"), ("CREAM", "CREAM"),
               ("LHAASO", "LHAASO_QGSJET-II-04")]
-HE_DATASETS = [("DAMPE", "DAMPE"), ("CALET", "CALET")]
 # Light (H+He) measurement: (label, total-energy table file).
-LIGHT_DATASETS = [("LHAASO", "LHAASO_QGSJET-II-04_light_totalEnergy.txt")]
-FIT_DATASET_TAG = "H:DAMPE,CALET,CREAM,LHAASO;He:DAMPE,CALET;light:LHAASO"
+LIGHT_DATASETS = [
+    ("DAMPE", "DAMPE_light_totalEnergy.txt"),
+    ("LHAASO", "LHAASO_QGSJET-II-04_light_totalEnergy.txt"),
+]
+DERIVED_LIGHT_EXPERIMENTS = ["CALET"]
+FIT_DATASET_TAG = (
+    "H:DAMPE,CALET,CREAM,LHAASO;He:none;"
+    "light:DAMPE,CALET-derived,LHAASO"
+)
 
 SCALE_EXPERIMENTS = ["CALET", "CREAM", "LHAASO"]      # DAMPE = reference
 CORRELATED_EXPERIMENTS = ["DAMPE", "CALET", "CREAM"]
-# Correlation of systematic errors between different observables.
-# The experiments do not provide the full cross-covariance here, so rho=0.5
-# is a moderate baseline assumption rather than a measured quantity.
-CROSS_OBSERVABLE_SYS_RHO = {"DAMPE": 0.5, "LHAASO": 0.5}
-if any(not -1.0 <= rho <= 1.0
-       for rho in CROSS_OBSERVABLE_SYS_RHO.values()):
-    raise ValueError("systematic correlation coefficients must lie in [-1, 1]")
+# Kept as output metadata and for compatibility with the plotting script.
+# No external H/light correlation coefficient is imposed; the covariance of
+# the derived CALET light data is handled explicitly in build_sys_groups().
+CROSS_OBSERVABLE_SYS_RHO = {}
 
 MIN_ENERGY = 1.0e3     # GeV
-MAX_ENERGY = 1.5e7     # GeV
+MAX_ENERGY = 1.0e7     # GeV
 R0 = 1.0e3             # GV, pivot rigidity where f(R0) = 1
-W_FIXED = 0.1
+W_FIXED = 0.05
 SYS_BINS_PER_DECADE = 2
 Z_HE = 2
 
@@ -119,17 +122,86 @@ def _read_light(filename, emin, emax):
     return (a[mask] for a in (x, y, slo, sup, ylo, yup))
 
 
+def _loglog_interpolate_with_errors(x_new, x, y, *errors):
+    """Log-log interpolate y and propagate independent endpoint errors."""
+    if np.any(x_new < x[0]) or np.any(x_new > x[-1]):
+        raise ValueError("interpolation requested outside the source range")
+
+    hi = np.searchsorted(x, x_new, side="right")
+    hi = np.clip(hi, 1, x.size - 1)
+    lo = hi - 1
+    t = ((np.log(x_new) - np.log(x[lo]))
+         / (np.log(x[hi]) - np.log(x[lo])))
+    y_new = np.exp((1.0 - t) * np.log(y[lo]) + t * np.log(y[hi]))
+
+    d_lo = y_new * (1.0 - t) / y[lo]
+    d_hi = y_new * t / y[hi]
+    propagated = [
+        np.sqrt((d_lo * error[lo]) ** 2 + (d_hi * error[hi]) ** 2)
+        for error in errors
+    ]
+    return (y_new, *propagated)
+
+
+def _build_calet_light(emin, emax):
+    """Construct CALET H+He on the proton grid with propagated errors.
+
+    Helium is interpolated in log(E)-log(I) space.  Statistical and systematic
+    endpoint errors are propagated through that interpolation, then the H and
+    interpolated-He errors are added in quadrature, separately for their lower
+    and upper values.  This reconstruction assumes the tabulated H and He
+    errors are independent because no cross-species covariance is available.
+    """
+    h = kiss_reader.load_experiment("CALET", "H", emin, emax)
+    he = kiss_reader.load_experiment("CALET", "He", 0.0, np.inf)
+    e_h, y_h, h_slo, h_sup, h_ylo, h_yup = h
+    e_he, y_he, he_slo, he_sup, he_ylo, he_yup = he
+
+    overlap = (e_h >= e_he[0]) & (e_h <= e_he[-1])
+    e_h = e_h[overlap]
+    y_h = y_h[overlap]
+    h_slo, h_sup = h_slo[overlap], h_sup[overlap]
+    h_ylo, h_yup = h_ylo[overlap], h_yup[overlap]
+
+    y_he_i, he_slo_i, he_sup_i, he_ylo_i, he_yup_i = (
+        _loglog_interpolate_with_errors(
+            e_h, e_he, y_he, he_slo, he_sup, he_ylo, he_yup
+        )
+    )
+    y_light = y_h + y_he_i
+    stat_lo = np.hypot(h_slo, he_slo_i)
+    stat_up = np.hypot(h_sup, he_sup_i)
+    sys_lo = np.hypot(h_ylo, he_ylo_i)
+    sys_up = np.hypot(h_yup, he_yup_i)
+    return (e_h, y_light, stat_lo, stat_up, sys_lo, sys_up,
+            0.5 * (h_slo + h_sup), 0.5 * (h_ylo + h_yup))
+
+
 def load_data():
-    keys = ("E", "y", "stat", "sys", "err_lo", "err_up", "exp", "obs")
+    keys = ("E", "y", "stat", "sys",
+            "stat_lo", "stat_up", "sys_lo", "sys_up",
+            "err_lo", "err_up", "light_h_stat", "light_h_sys",
+            "exp", "obs")
     out = {k: [] for k in keys}
 
-    def add(e, y, slo, sup, ylo, yup, label, obs):
+    def add(e, y, slo, sup, ylo, yup, label, obs,
+            light_h_stat=None, light_h_sys=None):
         out["E"].append(e)
         out["y"].append(y)
         out["stat"].append(0.5 * (slo + sup))
         out["sys"].append(0.5 * (ylo + yup))
+        out["stat_lo"].append(slo)
+        out["stat_up"].append(sup)
+        out["sys_lo"].append(ylo)
+        out["sys_up"].append(yup)
         out["err_lo"].append(np.sqrt(slo ** 2 + ylo ** 2))
         out["err_up"].append(np.sqrt(sup ** 2 + yup ** 2))
+        out["light_h_stat"].append(
+            np.zeros(e.size) if light_h_stat is None else light_h_stat
+        )
+        out["light_h_sys"].append(
+            np.zeros(e.size) if light_h_sys is None else light_h_sys
+        )
         out["exp"].append(np.full(e.size, label))
         out["obs"].append(np.full(e.size, obs))
 
@@ -137,32 +209,32 @@ def load_data():
         e, y, slo, sup, ylo, yup = kiss_reader.load_experiment(
             exp_name, "H", MIN_ENERGY, MAX_ENERGY)
         add(e, y, slo, sup, ylo, yup, label, "H")
-    for label, exp_name in HE_DATASETS:
-        e, y, slo, sup, ylo, yup = kiss_reader.load_experiment(
-            exp_name, "He", MIN_ENERGY, MAX_ENERGY)
-        add(e, y, slo, sup, ylo, yup, label, "He")
     for label, fname in LIGHT_DATASETS:
         e, y, slo, sup, ylo, yup = _read_light(fname, MIN_ENERGY, MAX_ENERGY)
         add(e, y, slo, sup, ylo, yup, label, "light")
+    e, y, slo, sup, ylo, yup, h_stat, h_sys = _build_calet_light(
+        MIN_ENERGY, MAX_ENERGY
+    )
+    add(e, y, slo, sup, ylo, yup, "CALET", "light",
+        light_h_stat=h_stat, light_h_sys=h_sys)
 
     return {k: np.concatenate(v) for k, v in out.items()}
 
 
 def build_sys_groups(data):
-    """Return index blocks and their systematic correlation matrices.
+    """Return index blocks and their statistical/systematic covariance pieces.
 
-    DAMPE uses half-decade blocks with H and He coupled by
-    ``CROSS_OBSERVABLE_SYS_RHO``.  LHAASO H and H+He are paired
-    at identical energies, while different energy bins remain independent.
+    DAMPE, CALET, and CREAM use fully correlated half-decade blocks within
+    each observable.  LHAASO points are independent.  DAMPE and LHAASO H and
+    H+He are not cross-correlated.  CALET H and derived H+He share the proton
+    statistical and systematic contributions, which are included here.
     """
     rbin = np.floor(SYS_BINS_PER_DECADE * np.log10(data["E"])).astype(int)
     grouped_indices = {}
     for i in range(data["E"].size):
         exp = data["exp"][i]
-        if exp == "DAMPE":
+        if exp == "CALET" and data["obs"][i] in ("H", "light"):
             key = (exp, rbin[i])
-        elif exp == "LHAASO":
-            key = (exp, data["E"][i])
         elif exp in CORRELATED_EXPERIMENTS:
             key = (exp, data["obs"][i], rbin[i])
         else:
@@ -172,21 +244,47 @@ def build_sys_groups(data):
     groups = []
     for indices in grouped_indices.values():
         idx = np.asarray(indices)
-        corr = np.eye(idx.size)
+        stat_cov = np.diag(data["stat"][idx] ** 2)
+        sys_cov = np.diag(data["sys"][idx] ** 2)
         exp = data["exp"][idx[0]]
 
-        if exp == "DAMPE":
-            same_observable = data["obs"][idx, None] == data["obs"][idx]
-            rho = CROSS_OBSERVABLE_SYS_RHO[exp]
-            corr = np.where(same_observable, 1.0, rho)
-        elif exp == "LHAASO" and idx.size > 1:
-            rho = CROSS_OBSERVABLE_SYS_RHO[exp]
-            corr[:] = rho
-            np.fill_diagonal(corr, 1.0)
-        elif exp in CORRELATED_EXPERIMENTS:
-            corr[:] = 1.0
+        if exp == "CALET":
+            obs = data["obs"][idx]
+            h_mode = np.zeros(idx.size)
+            he_mode = np.zeros(idx.size)
+            h_rows = obs == "H"
+            light_rows = obs == "light"
+            h_mode[h_rows] = data["sys"][idx[h_rows]]
+            h_mode[light_rows] = data["light_h_sys"][idx[light_rows]]
+            he_mode[light_rows] = np.sqrt(np.maximum(
+                data["sys"][idx[light_rows]] ** 2
+                - h_mode[light_rows] ** 2,
+                0.0,
+            ))
+            sys_cov = np.outer(h_mode, h_mode) + np.outer(he_mode, he_mode)
 
-        groups.append((idx, corr))
+            for a in range(idx.size):
+                for b in range(a + 1, idx.size):
+                    if {obs[a], obs[b]} != {"H", "light"}:
+                        continue
+                    h_local = a if obs[a] == "H" else b
+                    light_local = b if obs[b] == "light" else a
+                    h_global = idx[h_local]
+                    light_global = idx[light_local]
+
+                    if np.isclose(
+                            data["E"][h_global], data["E"][light_global],
+                            rtol=1e-12, atol=0.0):
+                        shared_stat = (
+                            data["stat"][h_global]
+                            * data["light_h_stat"][light_global]
+                        )
+                        stat_cov[h_local, light_local] = shared_stat
+                        stat_cov[light_local, h_local] = shared_stat
+        elif exp in CORRELATED_EXPERIMENTS:
+            sys_cov = np.outer(data["sys"][idx], data["sys"][idx])
+
+        groups.append((idx, stat_cov, sys_cov))
     return groups
 
 
@@ -239,11 +337,9 @@ def log_likelihood(theta, E, y, stat, sys, exp, obs, groups):
     pred *= f
     r = y - pred
     chi2 = 0.0
-    for idx, sys_corr in groups:
+    for idx, stat_cov, sys_cov in groups:
         rb = r[idx]
-        sg = sys[idx]
-        cov = (np.diag(stat[idx] ** 2)
-               + np.outer(sg, sg) * sys_corr)
+        cov = stat_cov + sys_cov
         chi2 += rb @ np.linalg.solve(cov, rb)
     return -0.5 * chi2
 
@@ -269,10 +365,11 @@ def print_parameter_recap():
     print("\nParameter recap:")
     print(f"  NDIM = {NDIM}")
     print("  Slopes are independent for H and He; rigidity breaks are shared.")
+    print("  No standalone helium observable is fitted.")
+    print("  The CALET He table enters only through the derived H+He spectrum.")
     print("  Priors are uniform open intervals: lo < theta < hi.")
-    print("  Cross-observable systematic correlations: "
-          + ", ".join(f"{exp} rho={rho:g}"
-                      for exp, rho in CROSS_OBSERVABLE_SYS_RHO.items()))
+    print("  DAMPE/LHAASO H-light systematic correlations: none")
+    print("  CALET light is derived from H+He; shared-H covariance is propagated.")
     print(f"  Fit datasets: {FIT_DATASET_TAG}")
     print(f"  Rigidity breaks: theta[{R_INDEX}:{R_INDEX + 3}]")
     print(f"  Energy-scale nuisances: theta[{SCALE_START}:{NDIM}] "
@@ -325,12 +422,19 @@ def main():
              r_index=R_INDEX, scale_start=SCALE_START,
              scale_experiments=np.array(SCALE_EXPERIMENTS),
              cross_observable_sys_experiments=np.array(
-                 list(CROSS_OBSERVABLE_SYS_RHO)),
+                 list(CROSS_OBSERVABLE_SYS_RHO), dtype=str),
              cross_observable_sys_rho=np.array(
-                 list(CROSS_OBSERVABLE_SYS_RHO.values())),
+                 list(CROSS_OBSERVABLE_SYS_RHO.values()), dtype=float),
              fit_dataset_tag=np.array(FIT_DATASET_TAG),
-             data_E=data["E"], data_y=data["y"], data_err_lo=data["err_lo"],
-             data_err_up=data["err_up"], data_exp=data["exp"], data_obs=data["obs"])
+             derived_light_experiments=np.array(
+                 DERIVED_LIGHT_EXPERIMENTS, dtype=str),
+             data_E=data["E"], data_y=data["y"],
+             data_stat_lo=data["stat_lo"], data_stat_up=data["stat_up"],
+             data_sys_lo=data["sys_lo"], data_sys_up=data["sys_up"],
+             data_light_h_stat=data["light_h_stat"],
+             data_light_h_sys=data["light_h_sys"],
+             data_err_lo=data["err_lo"], data_err_up=data["err_up"],
+             data_exp=data["exp"], data_obs=data["obs"])
     print(f"saved {OUTPUT}")
 
 

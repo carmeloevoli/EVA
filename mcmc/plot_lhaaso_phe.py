@@ -25,10 +25,11 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 import kiss_reader
-from mcmc_lhaaso_phe import (OUTPUT, components, MIN_ENERGY, SCALE_EXPERIMENTS,
-                             SCALE_START, R_INDEX, NDIM, A1_H, A1_HE, A2_H,
-                             A2_HE, A3_H, A3_HE, A4_H, A4_HE,
-                             CROSS_OBSERVABLE_SYS_RHO, FIT_DATASET_TAG)
+from mcmc_lhaaso_phe import (OUTPUT, components, load_data, MIN_ENERGY,
+                             SCALE_EXPERIMENTS, SCALE_START, R_INDEX, NDIM,
+                             A1_H, A1_HE, A2_H, A2_HE, A3_H, A3_HE, A4_H,
+                             A4_HE, CROSS_OBSERVABLE_SYS_RHO,
+                             FIT_DATASET_TAG)
 
 STYLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "EVA.mplstyle")
 FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
@@ -93,10 +94,62 @@ def validate_output(d):
         )
 
 
+def reload_and_validate_data(d):
+    """Reload source tables and verify that they match the fitted data."""
+    data = load_data()
+    stored_keys = {
+        "E": "data_E",
+        "y": "data_y",
+        "exp": "data_exp",
+        "obs": "data_obs",
+        "err_lo": "data_err_lo",
+        "err_up": "data_err_up",
+    }
+    for current_key, stored_key in stored_keys.items():
+        if stored_key not in d.files:
+            raise RuntimeError(
+                f"{OUTPUT} does not contain {stored_key}; cannot verify the "
+                "source data used by the fit."
+            )
+        current = data[current_key]
+        stored = d[stored_key]
+        if current.dtype.kind in "USO":
+            matches = np.array_equal(current, stored)
+        else:
+            matches = (
+                current.shape == stored.shape
+                and np.allclose(current, stored, rtol=1e-12, atol=0.0)
+            )
+        if not matches:
+            raise RuntimeError(
+                f"Current source-table field '{current_key}' does not match "
+                f"{stored_key} in {OUTPUT}. Re-run the fit before plotting."
+            )
+
+    optional_uncertainties = {
+        "stat_lo": "data_stat_lo",
+        "stat_up": "data_stat_up",
+        "sys_lo": "data_sys_lo",
+        "sys_up": "data_sys_up",
+        "light_h_stat": "data_light_h_stat",
+        "light_h_sys": "data_light_h_sys",
+    }
+    for current_key, stored_key in optional_uncertainties.items():
+        if stored_key in d.files and not np.allclose(
+                data[current_key], d[stored_key], rtol=1e-12, atol=0.0):
+            raise RuntimeError(
+                f"Current source-table field '{current_key}' does not match "
+                f"{stored_key} in {OUTPUT}. Re-run the fit before plotting."
+            )
+
+    print("verified current source tables against the data stored in the fit")
+    return data
+
+
 def _band(ax, Egrid, curves, color, scale, label, ls="-"):
     lo95, lo68, med, up68, up95 = np.percentile(curves, [2.5, 16, 50, 84, 97.5], axis=0)
-    ax.fill_between(Egrid, lo95 * scale, up95 * scale, color=color, alpha=0.12)
-    ax.fill_between(Egrid, lo68 * scale, up68 * scale, color=color, alpha=0.25)
+    ax.fill_between(Egrid, lo95 * scale, up95 * scale, color=color, alpha=0.07)
+    ax.fill_between(Egrid, lo68 * scale, up68 * scale, color=color, alpha=0.16)
     ax.plot(Egrid, med * scale, color=color, lw=3.0, ls=ls, zorder=10, label=label)
 
 
@@ -130,11 +183,12 @@ def load_calet_ratio():
     return x, y, err_lo, err_up
 
 
-def plot_spectrum(d):
+def plot_spectrum(d, data):
     samples = d["samples"]
-    E, y, elo, eup = d["data_E"], d["data_y"], d["data_err_lo"], d["data_err_up"]
-    exp, obs = d["data_exp"], d["data_obs"]
-    he_data = load_he_data()
+    E, y = data["E"], data["y"]
+    stat_lo, stat_up = data["stat_lo"], data["stat_up"]
+    sys_lo, sys_up = data["sys_lo"], data["sys_up"]
+    exp, obs = data["exp"], data["obs"]
     ms = {name: np.median(samples[:, SCALE_START + i])
           for i, name in enumerate(SCALE_EXPERIMENTS)}
 
@@ -147,7 +201,7 @@ def plot_spectrum(d):
     with plt.style.context(STYLE):
         fig, ax = plt.subplots(figsize=(12, 9.5))
         _band(ax, Egrid, IH, "tab:blue", scale, "H")
-        _band(ax, Egrid, IHe, "tab:red", scale, "He", ls="--")
+        _band(ax, Egrid, IHe, "tab:orange", scale, "He", ls="--")
         _band(ax, Egrid, IH + IHe, "tab:purple", scale, "H+He")
 
         for ob in ("H", "He", "light"):
@@ -157,13 +211,35 @@ def plot_spectrum(d):
                     continue
                 f = ms.get(name, 1.0)
                 Em = f * E[m]
-                ax.errorbar(Em, (y[m] / f) * Em ** PLOT_SLOPE,
-                            yerr=[(elo[m] / f) * Em ** PLOT_SLOPE,
-                                  (eup[m] / f) * Em ** PLOT_SLOPE],
+                plot_scale = Em ** PLOT_SLOPE / f
+                ym = y[m] * plot_scale
+                stat_lo_m = stat_lo[m] * plot_scale
+                stat_up_m = stat_up[m] * plot_scale
+                sys_lo_m = sys_lo[m] * plot_scale
+                sys_up_m = sys_up[m] * plot_scale
+                color = OBS_COLORS[ob]
+
+                sys_bottom = ym - sys_lo_m
+                sys_top = ym + sys_up_m
+                ax.vlines(
+                    Em, sys_bottom, sys_top, colors=color,
+                    linewidth=1.2, linestyles=":", alpha=0.9, zorder=2,
+                )
+                ax.plot(
+                    Em, sys_bottom, ls="", marker="_", markersize=8,
+                    markeredgewidth=1.2, color=color, alpha=0.9, zorder=2,
+                )
+                ax.plot(
+                    Em, sys_top, ls="", marker="_", markersize=8,
+                    markeredgewidth=1.2, color=color, alpha=0.9, zorder=2,
+                )
+
+                ax.errorbar(Em, ym,
+                            yerr=[stat_lo_m, stat_up_m],
                             fmt=EXP_MARKERS.get(name, "o"), markersize=7,
-                            markerfacecolor="white", markeredgecolor=OBS_COLORS[ob],
-                            markeredgewidth=1.5, color=OBS_COLORS[ob], elinewidth=1.5,
-                            capsize=3, alpha=0.7, zorder=3)
+                            markerfacecolor="white", markeredgecolor=color,
+                            markeredgewidth=1.5, color=color, elinewidth=1.5,
+                            capsize=3, alpha=0.8, zorder=3)
 
         # he_exp = he_data["exp"]
         # for name in dict.fromkeys(he_exp):
@@ -184,19 +260,33 @@ def plot_spectrum(d):
         ax.set_xlabel(r"$E$ [GeV]")
         ax.set_ylabel(r"$E^{2.6}\,I(E)$ [GeV$^{1.6}$ m$^{-2}$ s$^{-1}$ sr$^{-1}$]")
         comp_handles = [Line2D([], [], color="tab:blue", lw=3, label="H"),
-                        Line2D([], [], color="tab:red", lw=3, ls="--", label="He"),
+                        Line2D([], [], color="tab:orange", lw=3, ls="--", label="He"),
                         Line2D([], [], color="tab:purple", lw=3, label="H+He")]
+        plotted_observables = [
+            (ob, label)
+            for ob, label in (("H", "H data"), ("He", "He data"),
+                              ("light", "H+He data"))
+            if np.any(obs == ob)
+        ]
         obs_handles = [
             Line2D([], [], ls="", marker="o", markerfacecolor="white",
                    markeredgecolor=OBS_COLORS[ob], markeredgewidth=1.5,
                    color=OBS_COLORS[ob], label=label)
-            for ob, label in (("H", "H data"), ("He", "He data"),
-                              ("light", "H+He data"))
+            for ob, label in plotted_observables
         ]
         data_handles = [Line2D([], [], ls="", marker=mk, markerfacecolor="white",
                                markeredgecolor="0.3", markeredgewidth=1.5, label=e)
                         for e, mk in EXP_MARKERS.items()]
-        ax.legend(handles=comp_handles + obs_handles + data_handles, loc="lower left",
+        uncertainty_handles = [
+            Line2D([], [], ls="", marker="_", markersize=10,
+                   markeredgewidth=1.5, color="0.3",
+                   label="statistical error bar"),
+            Line2D([], [], ls=":", marker="_", markersize=8,
+                   markeredgewidth=1.2, lw=1.2, color="0.4",
+                   label="systematic error bar"),
+        ]
+        ax.legend(handles=comp_handles + obs_handles + data_handles
+                  + uncertainty_handles, loc="lower left",
                   fontsize=17, ncol=2)
         savefig(fig, "EVA_mcmc_lhaaso_phe_spectrum.pdf")
 
@@ -470,7 +560,8 @@ def report(d):
 def main():
     d = np.load(OUTPUT, allow_pickle=False)
     validate_output(d)
-    plot_spectrum(d)
+    data = reload_and_validate_data(d)
+    plot_spectrum(d, data)
     plot_helium_spectrum(d)
     plot_p_he_ratio(d)
     plot_breaks(d)
