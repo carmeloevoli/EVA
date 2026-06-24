@@ -1,0 +1,338 @@
+"""Joint MCMC of a two-component (H + He) model from direct data to LHAASO.
+
+A common rigidity-break pattern describes both components, while H and He each
+have their own normalization and spectral slopes:
+
+    I_H(E)  = K_H  * f_H(E)        (Z_H  = 1,  rigidity R = E)
+    I_He(E) = K_He * f_He(E / 2)   (Z_He = 2,  rigidity R = E / 2)
+
+so the three breaks sit at the same *rigidity* for both, i.e. at 2x the energy
+for helium.  The model is constrained simultaneously by:
+
+    * the proton measurement   I_H            (DAMPE, CALET, CREAM, LHAASO)
+    * the helium measurement   I_He           (DAMPE, CALET)
+    * the light measurement    I_H + I_He     (LHAASO)
+
+Energy-scale nuisances are per experiment (shared across observables), DAMPE =
+reference.  Statistical errors remain independent; systematic errors are
+correlated within energy blocks and between H/He for DAMPE and H/H+He for
+LHAASO.
+
+Run with:  python mcmc_lhaaso_phe.py
+"""
+
+import os
+
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
+from multiprocessing import Pool
+
+import numpy as np
+import emcee
+
+import kiss_reader
+from sbpl import sbpl
+
+NCORES = 16
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Proton measurement: (label, kiss_reader experiment).
+H_DATASETS = [("DAMPE", "DAMPE"), ("CALET", "CALET"), ("CREAM", "CREAM"),
+              ("LHAASO", "LHAASO_QGSJET-II-04")]
+HE_DATASETS = [("DAMPE", "DAMPE"), ("CALET", "CALET")]
+# Light (H+He) measurement: (label, total-energy table file).
+LIGHT_DATASETS = [("LHAASO", "LHAASO_QGSJET-II-04_light_totalEnergy.txt")]
+FIT_DATASET_TAG = "H:DAMPE,CALET,CREAM,LHAASO;He:DAMPE,CALET;light:LHAASO"
+
+SCALE_EXPERIMENTS = ["CALET", "CREAM", "LHAASO"]      # DAMPE = reference
+CORRELATED_EXPERIMENTS = ["DAMPE", "CALET", "CREAM"]
+# Correlation of systematic errors between different observables.
+# The experiments do not provide the full cross-covariance here, so rho=0.5
+# is a moderate baseline assumption rather than a measured quantity.
+CROSS_OBSERVABLE_SYS_RHO = {"DAMPE": 0.5, "LHAASO": 0.5}
+if any(not -1.0 <= rho <= 1.0
+       for rho in CROSS_OBSERVABLE_SYS_RHO.values()):
+    raise ValueError("systematic correlation coefficients must lie in [-1, 1]")
+
+MIN_ENERGY = 1.0e3     # GeV
+MAX_ENERGY = 1.5e7     # GeV
+R0 = 1.0e3             # GV, pivot rigidity where f(R0) = 1
+W_FIXED = 0.1
+SYS_BINS_PER_DECADE = 2
+Z_HE = 2
+
+# theta = [ log10K_H, log10K_He, a1_H, a1_He, a2_H, a2_He,
+#           a3_H, a3_He, a4_H, a4_He,
+#           log10R1..3, f per scale experiment ]
+# The spectral slopes differ between H and He; the rigidity breaks are shared.
+LABELS = [r"$\log_{10} K_{\rm H}$", r"$\log_{10} K_{\rm He}$",
+          r"$\alpha_{1,\rm H}$", r"$\alpha_{1,\rm He}$",
+          r"$\alpha_{2,\rm H}$", r"$\alpha_{2,\rm He}$",
+          r"$\alpha_{3,\rm H}$", r"$\alpha_{3,\rm He}$",
+          r"$\alpha_{4,\rm H}$", r"$\alpha_{4,\rm He}$",
+          r"$\log_{10} R_1$", r"$\log_{10} R_2$", r"$\log_{10} R_3$"]
+A1_H, A1_HE, A2_H, A2_HE = 2, 3, 4, 5
+A3_H, A3_HE, A4_H, A4_HE = 6, 7, 8, 9
+R_INDEX = 10
+SCALE_START = 13
+LABELS += [rf"$f_{{\rm {e}}}$" for e in SCALE_EXPERIMENTS]
+NDIM = len(LABELS)
+
+THETA0 = np.array([-4.07, -4.92, 2.59, 2.51, 2.90, 2.90, 2.63, 2.63,
+                   3.43, 3.43, 4.22, 5.34, 6.40]
+                  + [1.12, 1.15, 0.83])
+
+PRIOR_BOUNDS = [
+    (-8.0, 2.0),     # log10K_H
+    (-8.0, 2.0),     # log10K_He
+    (2.0, 4.0),      # alpha1_H
+    (2.0, 4.0),      # alpha1_He
+    (2.0, 4.0),      # alpha2_H
+    (2.0, 4.0),      # alpha2_He
+    (2.0, 4.0),      # alpha3_H
+    (2.0, 4.0),      # alpha3_He
+    (2.0, 4.5),      # alpha4_H
+    (2.0, 4.5),      # alpha4_He
+    (3.5, 5.0),      # log10 R1 (~10 TV)
+    (4.5, 6.0),      # log10 R2 (~100 TV)
+    (5.8, 6.8),      # log10 R3 (~3 PV)
+    (0.7, 1.3), (0.7, 1.3), (0.7, 1.3),   # widened energy-scale priors
+]
+
+OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output/EVA_mcmc_lhaaso_phe.npz")
+KISS_TABLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kiss_tables")
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+def _read_light(filename, emin, emax):
+    path = os.path.join(KISS_TABLES_DIR, filename)
+    x, y, slo, sup, ylo, yup = np.loadtxt(path, usecols=range(6), unpack=True)
+    mask = (x >= emin) & (x <= emax)
+    return (a[mask] for a in (x, y, slo, sup, ylo, yup))
+
+
+def load_data():
+    keys = ("E", "y", "stat", "sys", "err_lo", "err_up", "exp", "obs")
+    out = {k: [] for k in keys}
+
+    def add(e, y, slo, sup, ylo, yup, label, obs):
+        out["E"].append(e)
+        out["y"].append(y)
+        out["stat"].append(0.5 * (slo + sup))
+        out["sys"].append(0.5 * (ylo + yup))
+        out["err_lo"].append(np.sqrt(slo ** 2 + ylo ** 2))
+        out["err_up"].append(np.sqrt(sup ** 2 + yup ** 2))
+        out["exp"].append(np.full(e.size, label))
+        out["obs"].append(np.full(e.size, obs))
+
+    for label, exp_name in H_DATASETS:
+        e, y, slo, sup, ylo, yup = kiss_reader.load_experiment(
+            exp_name, "H", MIN_ENERGY, MAX_ENERGY)
+        add(e, y, slo, sup, ylo, yup, label, "H")
+    for label, exp_name in HE_DATASETS:
+        e, y, slo, sup, ylo, yup = kiss_reader.load_experiment(
+            exp_name, "He", MIN_ENERGY, MAX_ENERGY)
+        add(e, y, slo, sup, ylo, yup, label, "He")
+    for label, fname in LIGHT_DATASETS:
+        e, y, slo, sup, ylo, yup = _read_light(fname, MIN_ENERGY, MAX_ENERGY)
+        add(e, y, slo, sup, ylo, yup, label, "light")
+
+    return {k: np.concatenate(v) for k, v in out.items()}
+
+
+def build_sys_groups(data):
+    """Return index blocks and their systematic correlation matrices.
+
+    DAMPE uses half-decade blocks with H and He coupled by
+    ``CROSS_OBSERVABLE_SYS_RHO``.  LHAASO H and H+He are paired
+    at identical energies, while different energy bins remain independent.
+    """
+    rbin = np.floor(SYS_BINS_PER_DECADE * np.log10(data["E"])).astype(int)
+    grouped_indices = {}
+    for i in range(data["E"].size):
+        exp = data["exp"][i]
+        if exp == "DAMPE":
+            key = (exp, rbin[i])
+        elif exp == "LHAASO":
+            key = (exp, data["E"][i])
+        elif exp in CORRELATED_EXPERIMENTS:
+            key = (exp, data["obs"][i], rbin[i])
+        else:
+            key = ("indep", i)
+        grouped_indices.setdefault(key, []).append(i)
+
+    groups = []
+    for indices in grouped_indices.values():
+        idx = np.asarray(indices)
+        corr = np.eye(idx.size)
+        exp = data["exp"][idx[0]]
+
+        if exp == "DAMPE":
+            same_observable = data["obs"][idx, None] == data["obs"][idx]
+            rho = CROSS_OBSERVABLE_SYS_RHO[exp]
+            corr = np.where(same_observable, 1.0, rho)
+        elif exp == "LHAASO" and idx.size > 1:
+            rho = CROSS_OBSERVABLE_SYS_RHO[exp]
+            corr[:] = rho
+            np.fill_diagonal(corr, 1.0)
+        elif exp in CORRELATED_EXPERIMENTS:
+            corr[:] = 1.0
+
+        groups.append((idx, corr))
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Model and probability
+# ---------------------------------------------------------------------------
+
+def shape(theta, R, alphas):
+    """Rigidity shape f(R) with component-specific slopes."""
+    breaks = 10.0 ** theta[R_INDEX:R_INDEX + 3]
+    return sbpl(R, 1.0, alphas, breaks, W_FIXED, E0=R0)
+
+
+def components(theta, E):
+    """Return (I_H, I_He) at energies E."""
+    h_alphas = [theta[A1_H], theta[A2_H], theta[A3_H], theta[A4_H]]
+    he_alphas = [theta[A1_HE], theta[A2_HE], theta[A3_HE], theta[A4_HE]]
+    I_H = 10.0 ** theta[0] * shape(theta, E, h_alphas)
+    I_He = 10.0 ** theta[1] * shape(theta, E / Z_HE, he_alphas)
+    return I_H, I_He
+
+
+def energy_scales(theta, exp):
+    f = np.ones(exp.shape)
+    for name, value in zip(SCALE_EXPERIMENTS, theta[SCALE_START:]):
+        f[exp == name] = value
+    return f
+
+
+def log_prior(theta):
+    for value, (lo, hi) in zip(theta, PRIOR_BOUNDS):
+        if not (lo < value < hi):
+            return -np.inf
+    r1, r2, r3 = theta[R_INDEX:R_INDEX + 3]
+    if not (r1 < r2 < r3):
+        return -np.inf
+    return 0.0
+
+
+def log_likelihood(theta, E, y, stat, sys, exp, obs, groups):
+    f = energy_scales(theta, exp)
+    I_H, I_He = components(theta, f * E)
+    pred = np.empty_like(y)
+    pred[obs == "H"] = I_H[obs == "H"]
+    pred[obs == "He"] = I_He[obs == "He"]
+    pred[obs == "light"] = (I_H + I_He)[obs == "light"]
+    known = np.isin(obs, ("H", "He", "light"))
+    if not np.all(known):
+        raise ValueError(f"unknown observables: {np.unique(obs[~known])}")
+    pred *= f
+    r = y - pred
+    chi2 = 0.0
+    for idx, sys_corr in groups:
+        rb = r[idx]
+        sg = sys[idx]
+        cov = (np.diag(stat[idx] ** 2)
+               + np.outer(sg, sg) * sys_corr)
+        chi2 += rb @ np.linalg.solve(cov, rb)
+    return -0.5 * chi2
+
+
+def log_probability(theta, E, y, stat, sys, exp, obs, groups):
+    lp = log_prior(theta)
+    if not np.isfinite(lp):
+        return -np.inf
+    return lp + log_likelihood(theta, E, y, stat, sys, exp, obs, groups)
+
+
+# ---------------------------------------------------------------------------
+# MCMC
+# ---------------------------------------------------------------------------
+
+def print_parameter_recap():
+    if not (len(LABELS) == len(THETA0) == len(PRIOR_BOUNDS) == NDIM):
+        raise RuntimeError(
+            "inconsistent parameter configuration: LABELS, THETA0, "
+            "PRIOR_BOUNDS, and NDIM must have the same length"
+        )
+
+    print("\nParameter recap:")
+    print(f"  NDIM = {NDIM}")
+    print("  Slopes are independent for H and He; rigidity breaks are shared.")
+    print("  Priors are uniform open intervals: lo < theta < hi.")
+    print("  Cross-observable systematic correlations: "
+          + ", ".join(f"{exp} rho={rho:g}"
+                      for exp, rho in CROSS_OBSERVABLE_SYS_RHO.items()))
+    print(f"  Fit datasets: {FIT_DATASET_TAG}")
+    print(f"  Rigidity breaks: theta[{R_INDEX}:{R_INDEX + 3}]")
+    print(f"  Energy-scale nuisances: theta[{SCALE_START}:{NDIM}] "
+          f"for {', '.join(SCALE_EXPERIMENTS)}")
+    print("\n  idx  parameter                       theta0        prior")
+    print("  ---  ------------------------------  --------  ----------------")
+    for i, (label, theta0, (lo, hi)) in enumerate(zip(LABELS, THETA0, PRIOR_BOUNDS)):
+        print(f"  {i:3d}  {label:30s}  {theta0:8.3f}  ({lo:g}, {hi:g})")
+
+
+def run_mcmc(data, nwalkers=48, nsteps=30000, burnin=6000, seed=42):
+    rng = np.random.default_rng(seed)
+    pos = THETA0 + 1e-3 * rng.standard_normal((nwalkers, NDIM))
+    groups = build_sys_groups(data)
+    args = (data["E"], data["y"], data["stat"], data["sys"],
+            data["exp"], data["obs"], groups)
+    with Pool(processes=NCORES) as pool:
+        sampler = emcee.EnsembleSampler(
+            nwalkers, NDIM, log_probability, args=args, pool=pool)
+        sampler.run_mcmc(pos, nsteps, progress=True)
+
+    tau = sampler.get_autocorr_time(quiet=True)
+    print(f"\nacceptance={np.mean(sampler.acceptance_fraction):.3f}, "
+          f"max tau={np.nanmax(tau):.0f}, chain/tau={nsteps / np.nanmax(tau):.0f} "
+          f"(slowest: {LABELS[int(np.nanargmax(tau))]})")
+    return sampler.get_chain(discard=burnin, thin=15, flat=True)
+
+
+def print_summary(flat):
+    print("\nPosterior (median, 16th/84th):")
+    for i, label in enumerate(LABELS):
+        q16, q50, q84 = np.percentile(flat[:, i], [16, 50, 84])
+        print(f"  {label:18s} = {q50:9.3f}  (+{q84 - q50:.3f} / -{q50 - q16:.3f})")
+
+
+def main():
+    print_parameter_recap()
+    data = load_data()
+    nH = int((data["obs"] == "H").sum())
+    nHe = int((data["obs"] == "He").sum())
+    nL = int((data["obs"] == "light").sum())
+    print(f"loaded {data['E'].size} points (H: {nH}, He: {nHe}, light: {nL})")
+    flat = run_mcmc(data)
+    print(f"{flat.shape[0]} samples after burn-in/thinning")
+    print_summary(flat)
+
+    os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
+    np.savez(OUTPUT, samples=flat, labels=np.array(LABELS),
+             R0=R0, w_fixed=W_FIXED, min_energy=MIN_ENERGY, max_energy=MAX_ENERGY,
+             r_index=R_INDEX, scale_start=SCALE_START,
+             scale_experiments=np.array(SCALE_EXPERIMENTS),
+             cross_observable_sys_experiments=np.array(
+                 list(CROSS_OBSERVABLE_SYS_RHO)),
+             cross_observable_sys_rho=np.array(
+                 list(CROSS_OBSERVABLE_SYS_RHO.values())),
+             fit_dataset_tag=np.array(FIT_DATASET_TAG),
+             data_E=data["E"], data_y=data["y"], data_err_lo=data["err_lo"],
+             data_err_up=data["err_up"], data_exp=data["exp"], data_obs=data["obs"])
+    print(f"saved {OUTPUT}")
+
+
+if __name__ == "__main__":
+    main()
