@@ -1,4 +1,4 @@
-"""Plots for the two-component (H+He, shared rigidity-break) fit.
+"""Plots for the two-component (H+He, independent rigidity-break) fit.
 
 Reads the .npz from mcmc_lhaaso_phe.py and makes:
   * spectrum: I_H, I_He and I_H+I_He bands over the H, He and light data
@@ -7,7 +7,7 @@ Reads the .npz from mcmc_lhaaso_phe.py and makes:
         -> figures/EVA_mcmc_lhaaso_phe_helium_spectrum.pdf
   * p/He posterior over the CALET rigidity ratio
         -> figures/EVA_mcmc_lhaaso_phe_p_he_ratio.pdf
-  * the three rigidity-break posteriors
+  * the H/He rigidity-break posteriors and Z-scaling diagnostic
         -> figures/EVA_mcmc_lhaaso_phe_breaks.pdf
   * a paired H/He slope fingerprint
         -> figures/EVA_mcmc_lhaaso_phe_slope_fingerprint.pdf
@@ -26,7 +26,8 @@ from matplotlib.lines import Line2D
 
 import kiss_reader
 from mcmc_lhaaso_phe import (OUTPUT, components, load_data, MIN_ENERGY,
-                             SCALE_EXPERIMENTS, SCALE_START, R_INDEX, NDIM,
+                             SCALE_EXPERIMENTS, SCALE_START, H_R_INDEX,
+                             HE_R_INDEX, NDIM, Z_HE,
                              A1_H, A1_HE, A2_H, A2_HE, A3_H, A3_HE, A4_H,
                              A4_HE, CROSS_OBSERVABLE_SYS_RHO,
                              FIT_DATASET_TAG)
@@ -69,6 +70,12 @@ def validate_output(d):
         raise RuntimeError(
             f"{OUTPUT} has {nsamples} samples with {ndim} parameters, but the "
             "stored labels have a different length."
+        )
+    if ("model_kind" not in d.files
+            or str(d["model_kind"]) != "independent_h_he_rigidity_breaks"):
+        raise RuntimeError(
+            f"{OUTPUT} was generated with a different break parameterization. "
+            "Re-run mcmc_lhaaso_phe.py before plotting."
         )
     covariance_keys = ("cross_observable_sys_experiments",
                        "cross_observable_sys_rho")
@@ -400,17 +407,59 @@ def plot_p_he_ratio(d):
 def plot_breaks(d):
     samples = d["samples"]
     with plt.style.context(STYLE):
-        fig, ax = plt.subplots(figsize=(11, 8))
+        fig, (ax_breaks, ax_scaling) = plt.subplots(
+            2, 1, figsize=(11.5, 10.2),
+            gridspec_kw={"height_ratios": [2.0, 1.2], "hspace": 0.30}
+        )
         for j, color, name in BREAK_INFO:
-            c = samples[:, R_INDEX + j]
-            q16, q50, q84 = np.percentile(c, [16, 50, 84])
-            ax.hist(c, bins=70, density=True, histtype="stepfilled", color=color, alpha=0.30)
-            ax.hist(c, bins=70, density=True, histtype="step", color=color, lw=2.5,
-                    label=rf"{name}: ${q50:.2f}^{{+{q84 - q50:.2f}}}_{{-{q50 - q16:.2f}}}$")
-            ax.axvline(q50, color=color, lw=1.5, ls="--")
-        ax.set_xlabel(r"$\log_{10}(R_b\,/\,{\rm GV})$")
-        ax.set_ylabel("posterior density")
-        ax.legend(fontsize=20)
+            h = samples[:, H_R_INDEX + j]
+            he = samples[:, HE_R_INDEX + j]
+            h16, h50, h84 = np.percentile(h, [16, 50, 84])
+            he16, he50, he84 = np.percentile(he, [16, 50, 84])
+            ax_breaks.hist(
+                h, bins=70, density=True, histtype="stepfilled",
+                color=color, alpha=0.20
+            )
+            ax_breaks.hist(
+                h, bins=70, density=True, histtype="step",
+                color=color, lw=2.5,
+                label=(rf"{name} H: ${h50:.2f}^{{+{h84 - h50:.2f}}}"
+                       rf"_{{-{h50 - h16:.2f}}}$")
+            )
+            ax_breaks.hist(
+                he, bins=70, density=True, histtype="step",
+                color=color, lw=2.5, ls="--",
+                label=(rf"{name} He: ${he50:.2f}^{{+{he84 - he50:.2f}}}"
+                       rf"_{{-{he50 - he16:.2f}}}$")
+            )
+            ax_breaks.axvline(h50, color=color, lw=1.4, ls="-")
+            ax_breaks.axvline(he50, color=color, lw=1.4, ls="--")
+
+            log_r_ratio = he - h
+            d16, d50, d84 = np.percentile(log_r_ratio, [16, 50, 84])
+            ax_scaling.hist(
+                log_r_ratio, bins=70, density=True, histtype="stepfilled",
+                color=color, alpha=0.22
+            )
+            ax_scaling.hist(
+                log_r_ratio, bins=70, density=True, histtype="step",
+                color=color, lw=2.5,
+                label=(rf"{name}: ${d50:+.2f}^{{+{d84 - d50:.2f}}}"
+                       rf"_{{-{d50 - d16:.2f}}}$")
+            )
+
+        ax_breaks.set_xlabel(r"$\log_{10}(R_b\,/\,{\rm GV})$")
+        ax_breaks.set_ylabel("posterior density")
+        ax_breaks.legend(fontsize=14, ncol=2)
+
+        ax_scaling.axvline(0.0, color="0.15", lw=1.5, ls="--",
+                           label="Z-scaling")
+        ax_scaling.set_xlabel(
+            r"$\log_{10}(R_{b,\rm He}/R_{b,\rm H})$"
+            r"$=\log_{10}[(E_{b,\rm He}/E_{b,\rm H})/2]$"
+        )
+        ax_scaling.set_ylabel("posterior density")
+        ax_scaling.legend(fontsize=15, ncol=2)
         savefig(fig, "EVA_mcmc_lhaaso_phe_breaks.pdf")
 
 
@@ -525,11 +574,37 @@ def plot_corner(d):
 
 def report(d):
     s = d["samples"]
-    print("\nRigidity breaks log10(R/GV)  (E_b(H)=R, E_b(He)=2R):")
+    print("\nRigidity breaks log10(R/GV):")
     for j, _, name in BREAK_INFO:
-        q16, q50, q84 = np.percentile(s[:, R_INDEX + j], [16, 50, 84])
-        print(f"  {name:10s}: {q50:.2f} (+{q84 - q50:.2f}/-{q50 - q16:.2f})  "
-              f"R={10 ** q50 / 1e6:.2f} PV -> E_He={2 * 10 ** q50 / 1e6:.2f} PeV")
+        h16, h50, h84 = np.percentile(
+            s[:, H_R_INDEX + j], [16, 50, 84]
+        )
+        he16, he50, he84 = np.percentile(
+            s[:, HE_R_INDEX + j], [16, 50, 84]
+        )
+        print(
+            f"  {name:10s} H : {h50:.2f} "
+            f"(+{h84 - h50:.2f}/-{h50 - h16:.2f})  "
+            f"E_H={10 ** h50 / 1e6:.2f} PeV"
+        )
+        print(
+            f"  {name:10s} He: {he50:.2f} "
+            f"(+{he84 - he50:.2f}/-{he50 - he16:.2f})  "
+            f"E_He={Z_HE * 10 ** he50 / 1e6:.2f} PeV"
+        )
+
+    print("\nZ-scaling check:")
+    print("  Z-scaling means R_He/R_H = 1, or E_b,He/E_b,H = 2.")
+    for j, _, name in BREAK_INFO:
+        log_r_ratio = s[:, HE_R_INDEX + j] - s[:, H_R_INDEX + j]
+        energy_ratio = Z_HE * 10.0 ** log_r_ratio
+        d16, d50, d84 = np.percentile(log_r_ratio, [16, 50, 84])
+        e16, e50, e84 = np.percentile(energy_ratio, [16, 50, 84])
+        print(
+            f"  {name:10s}: log10(R_He/R_H)={d50:+.3f} "
+            f"(+{d84 - d50:.3f}/-{d50 - d16:.3f}); "
+            f"E_He/E_H={e50:.2f} (+{e84 - e50:.2f}/-{e50 - e16:.2f})"
+        )
     h_idx = (A1_H, A2_H, A3_H, A4_H)
     he_idx = (A1_HE, A2_HE, A3_HE, A4_HE)
     h_slopes = [np.median(s[:, i]) for i in h_idx]

@@ -1,13 +1,15 @@
 """Joint MCMC of a two-component (H + He) model from direct data to LHAASO.
 
-A common rigidity-break pattern describes both components, while H and He each
-have their own normalization and spectral slopes:
+Independent rigidity-break patterns describe H and He, while each component
+also has its own normalization and spectral slopes:
 
     I_H(E)  = K_H  * f_H(E)        (Z_H  = 1,  rigidity R = E)
     I_He(E) = K_He * f_He(E / 2)   (Z_He = 2,  rigidity R = E / 2)
 
-so the three breaks sit at the same *rigidity* for both, i.e. at 2x the energy
-for helium.  The model is constrained simultaneously by:
+The three H and He breaks are fitted separately in rigidity.  A posteriori,
+Z-scaling is recovered if R_{i,He} / R_{i,H} is consistent with 1, equivalently
+if E_{i,He} / E_{i,H} is consistent with 2.  The model is constrained
+simultaneously by:
 
     * the proton measurement   I_H            (DAMPE, CALET, CREAM, LHAASO)
     * the light measurement    I_H + I_He     (DAMPE, CALET, LHAASO)
@@ -71,23 +73,32 @@ Z_HE = 2
 
 # theta = [ log10K_H, log10K_He, a1_H, a1_He, a2_H, a2_He,
 #           a3_H, a3_He, a4_H, a4_He,
-#           log10R1..3, f per scale experiment ]
-# The spectral slopes differ between H and He; the rigidity breaks are shared.
+#           log10R1..3_H, log10R1..3_He, f per scale experiment ]
+# The spectral slopes and rigidity breaks differ between H and He.
 LABELS = [r"$\log_{10} K_{\rm H}$", r"$\log_{10} K_{\rm He}$",
           r"$\alpha_{1,\rm H}$", r"$\alpha_{1,\rm He}$",
           r"$\alpha_{2,\rm H}$", r"$\alpha_{2,\rm He}$",
           r"$\alpha_{3,\rm H}$", r"$\alpha_{3,\rm He}$",
           r"$\alpha_{4,\rm H}$", r"$\alpha_{4,\rm He}$",
-          r"$\log_{10} R_1$", r"$\log_{10} R_2$", r"$\log_{10} R_3$"]
+          r"$\log_{10} R_{1,\rm H}$",
+          r"$\log_{10} R_{2,\rm H}$",
+          r"$\log_{10} R_{3,\rm H}$",
+          r"$\log_{10} R_{1,\rm He}$",
+          r"$\log_{10} R_{2,\rm He}$",
+          r"$\log_{10} R_{3,\rm He}$"]
 A1_H, A1_HE, A2_H, A2_HE = 2, 3, 4, 5
 A3_H, A3_HE, A4_H, A4_HE = 6, 7, 8, 9
-R_INDEX = 10
-SCALE_START = 13
+H_R_INDEX = 10
+HE_R_INDEX = 13
+R_INDEX = H_R_INDEX
+SCALE_START = 16
 LABELS += [rf"$f_{{\rm {e}}}$" for e in SCALE_EXPERIMENTS]
 NDIM = len(LABELS)
 
 THETA0 = np.array([-4.07, -4.92, 2.59, 2.51, 2.90, 2.90, 2.63, 2.63,
-                   3.43, 3.43, 4.22, 5.34, 6.40]
+                   3.43, 3.43,
+                   4.22, 5.34, 6.40,
+                   4.22, 5.34, 6.40]
                   + [1.12, 1.15, 0.83])
 
 PRIOR_BOUNDS = [
@@ -101,9 +112,12 @@ PRIOR_BOUNDS = [
     (2.0, 4.0),      # alpha3_He
     (2.0, 4.5),      # alpha4_H
     (2.0, 4.5),      # alpha4_He
-    (3.5, 5.0),      # log10 R1 (~10 TV)
-    (4.5, 6.0),      # log10 R2 (~100 TV)
-    (5.8, 6.8),      # log10 R3 (~3 PV)
+    (3.5, 5.0),      # log10 R1_H (~10 TV)
+    (4.5, 6.0),      # log10 R2_H (~100 TV)
+    (5.8, 6.8),      # log10 R3_H (~3 PV)
+    (3.5, 5.0),      # log10 R1_He (~10 TV)
+    (4.5, 6.0),      # log10 R2_He (~100 TV)
+    (5.8, 6.8),      # log10 R3_He (~3 PV)
     (0.7, 1.3), (0.7, 1.3), (0.7, 1.3),   # widened energy-scale priors
 ]
 
@@ -292,9 +306,9 @@ def build_sys_groups(data):
 # Model and probability
 # ---------------------------------------------------------------------------
 
-def shape(theta, R, alphas):
+def shape(R, alphas, log10_breaks):
     """Rigidity shape f(R) with component-specific slopes."""
-    breaks = 10.0 ** theta[R_INDEX:R_INDEX + 3]
+    breaks = 10.0 ** np.asarray(log10_breaks)
     return sbpl(R, 1.0, alphas, breaks, W_FIXED, E0=R0)
 
 
@@ -302,8 +316,10 @@ def components(theta, E):
     """Return (I_H, I_He) at energies E."""
     h_alphas = [theta[A1_H], theta[A2_H], theta[A3_H], theta[A4_H]]
     he_alphas = [theta[A1_HE], theta[A2_HE], theta[A3_HE], theta[A4_HE]]
-    I_H = 10.0 ** theta[0] * shape(theta, E, h_alphas)
-    I_He = 10.0 ** theta[1] * shape(theta, E / Z_HE, he_alphas)
+    h_breaks = theta[H_R_INDEX:H_R_INDEX + 3]
+    he_breaks = theta[HE_R_INDEX:HE_R_INDEX + 3]
+    I_H = 10.0 ** theta[0] * shape(E, h_alphas, h_breaks)
+    I_He = 10.0 ** theta[1] * shape(E / Z_HE, he_alphas, he_breaks)
     return I_H, I_He
 
 
@@ -318,9 +334,10 @@ def log_prior(theta):
     for value, (lo, hi) in zip(theta, PRIOR_BOUNDS):
         if not (lo < value < hi):
             return -np.inf
-    r1, r2, r3 = theta[R_INDEX:R_INDEX + 3]
-    if not (r1 < r2 < r3):
-        return -np.inf
+    for start in (H_R_INDEX, HE_R_INDEX):
+        r1, r2, r3 = theta[start:start + 3]
+        if not (r1 < r2 < r3):
+            return -np.inf
     return 0.0
 
 
@@ -364,14 +381,16 @@ def print_parameter_recap():
 
     print("\nParameter recap:")
     print(f"  NDIM = {NDIM}")
-    print("  Slopes are independent for H and He; rigidity breaks are shared.")
+    print("  Slopes and rigidity breaks are independent for H and He.")
+    print("  Z-scaling is checked a posteriori from R_He / R_H.")
     print("  No standalone helium observable is fitted.")
     print("  The CALET He table enters only through the derived H+He spectrum.")
     print("  Priors are uniform open intervals: lo < theta < hi.")
     print("  DAMPE/LHAASO H-light systematic correlations: none")
     print("  CALET light is derived from H+He; shared-H covariance is propagated.")
     print(f"  Fit datasets: {FIT_DATASET_TAG}")
-    print(f"  Rigidity breaks: theta[{R_INDEX}:{R_INDEX + 3}]")
+    print(f"  H rigidity breaks: theta[{H_R_INDEX}:{H_R_INDEX + 3}]")
+    print(f"  He rigidity breaks: theta[{HE_R_INDEX}:{HE_R_INDEX + 3}]")
     print(f"  Energy-scale nuisances: theta[{SCALE_START}:{NDIM}] "
           f"for {', '.join(SCALE_EXPERIMENTS)}")
     print("\n  idx  parameter                       theta0        prior")
@@ -402,7 +421,26 @@ def print_summary(flat):
     print("\nPosterior (median, 16th/84th):")
     for i, label in enumerate(LABELS):
         q16, q50, q84 = np.percentile(flat[:, i], [16, 50, 84])
-        print(f"  {label:18s} = {q50:9.3f}  (+{q84 - q50:.3f} / -{q50 - q16:.3f})")
+        print(f"  {label:26s} = {q50:9.3f}  (+{q84 - q50:.3f} / -{q50 - q16:.3f})")
+
+
+def print_z_scaling_summary(flat):
+    print("\nPosterior Z-scaling check:")
+    print("  Z-scaling means R_He/R_H = 1, or E_b,He/E_b,H = 2.")
+    names = ("break 1", "break 2", "break 3")
+    h_log_r = flat[:, H_R_INDEX:H_R_INDEX + 3]
+    he_log_r = flat[:, HE_R_INDEX:HE_R_INDEX + 3]
+    for j, name in enumerate(names):
+        log_r_ratio = he_log_r[:, j] - h_log_r[:, j]
+        energy_ratio = Z_HE * 10.0 ** log_r_ratio
+        d16, d50, d84 = np.percentile(log_r_ratio, [16, 50, 84])
+        e16, e50, e84 = np.percentile(energy_ratio, [16, 50, 84])
+        print(
+            f"  {name}: log10(R_He/R_H) = {d50:+.3f} "
+            f"(+{d84 - d50:.3f}/-{d50 - d16:.3f}); "
+            f"E_He/E_H = {e50:.2f} "
+            f"(+{e84 - e50:.2f}/-{e50 - e16:.2f})"
+        )
 
 
 def main():
@@ -415,11 +453,15 @@ def main():
     flat = run_mcmc(data)
     print(f"{flat.shape[0]} samples after burn-in/thinning")
     print_summary(flat)
+    print_z_scaling_summary(flat)
 
     os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
     np.savez(OUTPUT, samples=flat, labels=np.array(LABELS),
              R0=R0, w_fixed=W_FIXED, min_energy=MIN_ENERGY, max_energy=MAX_ENERGY,
+             model_kind=np.array("independent_h_he_rigidity_breaks"),
+             h_r_index=H_R_INDEX, he_r_index=HE_R_INDEX,
              r_index=R_INDEX, scale_start=SCALE_START,
+             z_he=Z_HE,
              scale_experiments=np.array(SCALE_EXPERIMENTS),
              cross_observable_sys_experiments=np.array(
                  list(CROSS_OBSERVABLE_SYS_RHO), dtype=str),
