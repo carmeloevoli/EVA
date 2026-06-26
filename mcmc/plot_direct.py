@@ -13,16 +13,21 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from scipy.stats import norm, gaussian_kde
 
-from mcmc_direct import (OUTPUT, SPECIES, Z, E0_P, E_MIN_P, SCALE_EXPERIMENTS,
-                         SCALE_START, species_model, RB_INDEX, SLOPE_INDEX)
+import kiss_reader
+from mcmc_direct import (OUTPUT, SPECIES, Z, E0_P, E_MIN_P, MAX_ENERGY,
+                         SCALE_EXPERIMENTS, SCALE_START, species_model,
+                         RB_INDEX, SLOPE_INDEX)
 
 plt.style.use(os.path.join(os.path.dirname(os.path.abspath(__file__)), "EVA.mplstyle"))
 
 FIGURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figures")
 PLOT_EMAX = 3.0e6   # GeV, upper energy for the model bands (extrapolated beyond the fit)
 PLOT_SLOPE = 2.6    # the spectra are shown multiplied by E**PLOT_SLOPE
+LHAASO_PLOT_EMAX = 1.2e7
+EXTRAPOLATION_PLOT_EMIN = 1.0e4
+EXTRAPOLATION_START = 3.0e5
+LHAASO_EXPERIMENT = "LHAASO_QGSJET-II-04"
 SPECIES_COLORS = {"H": "tab:blue", "He": "tab:red", "C": "tab:green",
                   "O": "tab:orange", "Fe": "tab:purple"}
 EXP_MARKERS = {"DAMPE": "o", "CALET": "s", "CREAM": "^", "ISS-CREAM": "D"}
@@ -66,81 +71,6 @@ def plot_breaks(samples):
     savefig(fig, "EVA_mcmc_direct_breaks.pdf")
 
 
-BREAK_PAIRS = [("nuclei - p", "heavy", "H", "tab:green"),
-               ("He - p", "He", "H", "tab:red"),
-               ("He - nuclei", "He", "heavy", "tab:purple")]
-
-
-def _hdi(x, cred=0.68):
-    """Narrowest (highest-density) interval containing a fraction ``cred``."""
-    xs = np.sort(x)
-    n = len(xs)
-    k = max(1, int(np.floor(cred * n)))
-    widths = xs[k:] - xs[:n - k]
-    i = int(np.argmin(widths))
-    return xs[i], xs[i + k]
-
-
-def _direction_sigma(delta, n):
-    """Tail-probability -> Gaussian sigma for a difference vs zero.
-
-    Uses the probability of direction: the fraction of the posterior sharing
-    the sign of the median, converted to an equivalent one-sided Gaussian level.
-    Returns (n_sigma, p_cross, is_lower_bound)."""
-    p_cross = np.mean(delta < 0) if np.median(delta) >= 0 else np.mean(delta > 0)
-    if p_cross == 0:                 # unresolved by the finite sample
-        return norm.ppf(1 - 1.0 / n), 1.0 / n, True
-    return norm.ppf(1 - p_cross), p_cross, False
-
-
-def report_break_differences(samples):
-    """Print the posterior of the pairwise rigidity-break differences with the
-    68% HDI and the tail-probability -> sigma significance (correlations kept)."""
-    rb = {g: samples[:, RB_INDEX[g]] for g in ("H", "He", "heavy")}
-    n = len(samples)
-    print("\nPairwise rigidity-break differences "
-          "Delta = log10(R_b,X) - log10(R_b,Y) [dex]:")
-    for label, X, Y, _ in BREAK_PAIRS:
-        delta = rb[X] - rb[Y]
-        med = np.median(delta)
-        h_lo, h_hi = _hdi(delta, 0.68)
-        nsig, p_cross, lower = _direction_sigma(delta, n)
-        sig_str = f">{nsig:.1f}" if lower else f"{nsig:.1f}"
-        p_str = f"<{100 / n:.2g}%" if lower else f"{p_cross * 100:.2f}%"
-        print(f"  {label:13s}: median={med:+.3f} dex (R_b ratio {10 ** med:.2f}), "
-              f"68% HDI=[{h_lo:+.3f}, {h_hi:+.3f}], "
-              f"P(cross 0)={p_str}, significance={sig_str} sigma")
-
-
-def plot_break_differences(samples):
-    """Posterior of the pairwise rigidity-break differences, with zero marked."""
-    rb = {g: samples[:, RB_INDEX[g]] for g in ("H", "He", "heavy")}
-    deltas = {lab: rb[X] - rb[Y] for lab, X, Y, _ in BREAK_PAIRS}
-    lo = min(d.min() for d in deltas.values())
-    hi = max(d.max() for d in deltas.values())
-    bins = np.linspace(lo, hi, 60)
-
-    n = len(samples)
-    fig, ax = plt.subplots(figsize=(11, 8))
-    for label, X, Y, color in BREAK_PAIRS:
-        delta = deltas[label]
-        med = np.median(delta)
-        nsig, _, lower = _direction_sigma(delta, n)
-        sig_str = rf">{nsig:.1f}\sigma" if lower else rf"{nsig:.1f}\sigma"
-        ax.hist(delta, bins=bins, density=True, histtype="stepfilled",
-                color=color, alpha=0.25)
-        ax.hist(delta, bins=bins, density=True, histtype="step", color=color, lw=2.5,
-                label=rf"{label}: ${med:+.2f}$ (${sig_str}$)")
-        ax.axvline(med, color=color, lw=1.5, ls="--")
-    ax.axvline(0.0, color="k", lw=2.0)
-
-    ax.set_xlabel(r"$\Delta \log_{10} R_b$ [dex]")
-    ax.set_ylabel("posterior density")
-    ax.set_title("Pairwise break differences")
-    ax.legend(fontsize=20)
-    savefig(fig, "EVA_mcmc_direct_break_diffs.pdf")
-
-
 GROUP_META = [("H", "tab:blue", "p"),
               ("He", "tab:red", "He"),
               ("heavy", "tab:green", "nuclei")]
@@ -159,6 +89,18 @@ def _overlay_kde_2d(ax, series, cred=(0.68, 0.95)):
 
     ``series`` is a list of (color, x, y); a common robust axis range is used.
     """
+    from scipy.stats import gaussian_kde
+
+    clean_series = []
+    for color, x, y in series:
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = np.asarray(x[finite], dtype=float)
+        y = np.asarray(y[finite], dtype=float)
+        if len(x) < 3 or np.ptp(x) == 0.0 or np.ptp(y) == 0.0:
+            raise ValueError("KDE input needs at least three varying finite samples")
+        clean_series.append((color, x, y))
+    series = clean_series
+
     rng = np.random.default_rng(0)
     xs = np.concatenate([x for _, x, _ in series])
     ys = np.concatenate([y for _, _, y in series])
@@ -172,7 +114,14 @@ def _overlay_kde_2d(ax, series, cred=(0.68, 0.95)):
 
     for color, x, y in series:
         sub = rng.choice(len(x), size=min(6000, len(x)), replace=False)
-        dens = gaussian_kde(np.vstack([x[sub], y[sub]]))(grid).reshape(XX.shape)
+        values = np.vstack([x[sub], y[sub]])
+        # NumPy's Accelerate-backed weighted covariance can emit spurious
+        # floating-point warnings here even though the covariance is finite.
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            kde = gaussian_kde(values)
+        dens = kde(grid).reshape(XX.shape)
+        if not np.all(np.isfinite(dens)):
+            raise FloatingPointError("KDE produced non-finite density values")
         levels = sorted(_kde_levels(dens, cred))       # ascending for contour()
         ax.contourf(XX, YY, dens, levels=[levels[0], dens.max()],
                     colors=[color], alpha=0.18)
@@ -247,12 +196,23 @@ def plot_reconstruction(d):
             f = median_scale.get(name, 1.0)
             Em = f * E[m]
             yv = (y[m] / f) * Em ** PLOT_SLOPE
-            # systematic error: wide, semi-transparent bar without caps (drawn behind)
-            ax.errorbar(Em, yv,
-                        yerr=[(sys_lo[m] / f) * Em ** PLOT_SLOPE, (sys_up[m] / f) * Em ** PLOT_SLOPE],
-                        fmt="none", ecolor=color, elinewidth=5.0, alpha=0.30,
-                        capsize=0, zorder=2)
-            # statistical error: crisp bar with caps + open marker on top
+            sys_bottom = yv - (sys_lo[m] / f) * Em ** PLOT_SLOPE
+            sys_top = yv + (sys_up[m] / f) * Em ** PLOT_SLOPE
+            # Systematic uncertainty: dotted interval with short end ticks.
+            ax.vlines(
+                Em, sys_bottom, sys_top,
+                color=color, linewidth=1.2, linestyles=":",
+                alpha=0.9, zorder=2,
+            )
+            ax.plot(
+                Em, sys_bottom, ls="", marker="_", markersize=7,
+                markeredgewidth=1.2, color=color, zorder=2,
+            )
+            ax.plot(
+                Em, sys_top, ls="", marker="_", markersize=7,
+                markeredgewidth=1.2, color=color, zorder=2,
+            )
+            # Statistical uncertainty: solid capped bar and open data marker.
             ax.errorbar(Em, yv,
                         yerr=[(stat_lo[m] / f) * Em ** PLOT_SLOPE, (stat_up[m] / f) * Em ** PLOT_SLOPE],
                         fmt=EXP_MARKERS.get(name, "o"), markersize=8,
@@ -265,24 +225,185 @@ def plot_reconstruction(d):
     ax.set_xlim(E_MIN_P, PLOT_EMAX)
     ax.set_xlabel(r"$E$ [GeV]")
     ax.set_ylabel(r"$E^{2.6}\,I(E)$ [GeV$^{1.6}$ m$^{-2}$ s$^{-1}$ sr$^{-1}$]")
-    ax.set_title("Direct spectra -- single-break SBPL")
 
     species_handles = [Line2D([], [], color=SPECIES_COLORS.get(s, "k"), lw=3, label=s)
                        for s in SPECIES]
-    exp_handles = [Line2D([], [], ls="", marker=EXP_MARKERS.get(e, "o"), markersize=9,
-                          markerfacecolor="white", markeredgecolor="0.3",
-                          markeredgewidth=1.8, label=e) for e in used_exp]
+    exp_handles = []
+    for e in used_exp:
+        factor = median_scale.get(e, 1.0)
+        scale_label = (
+            rf"$f={factor:.2f}$"
+            if e in SCALE_EXPERIMENTS
+            else r"$f=1$ (reference)"
+        )
+        exp_handles.append(
+            Line2D(
+                [], [], ls="", marker=EXP_MARKERS.get(e, "o"),
+                markersize=9, markerfacecolor="white",
+                markeredgecolor="0.3", markeredgewidth=1.8,
+                label=rf"{e} ({scale_label})",
+            )
+        )
     ax.legend(handles=species_handles + exp_handles,
               loc="lower left", fontsize=18, ncol=2)
     savefig(fig, "EVA_mcmc_direct_spectrum.pdf")
 
 
+def plot_lhaaso_extrapolation(d):
+    """Compare direct-fit H, He, and H+He extrapolations with LHAASO."""
+    samples = d["samples"]
+    rng = np.random.default_rng(4)
+    idx = rng.choice(
+        len(samples), size=min(2000, len(samples)), replace=False
+    )
+
+    lhaaso_data = {}
+    dampe_data = {}
+    for species in ("H", "He"):
+        lhaaso_data[species] = kiss_reader.load_experiment(
+            LHAASO_EXPERIMENT, species, 0.0, LHAASO_PLOT_EMAX
+        )
+        dampe_data[species] = kiss_reader.load_experiment(
+            "DAMPE", species, EXTRAPOLATION_PLOT_EMIN, LHAASO_PLOT_EMAX
+        )
+    light_path = os.path.join(
+        kiss_reader.KISS_TABLES_DIR,
+        "LHAASO_QGSJET-II-04_light_totalEnergy.txt",
+    )
+    light_data = np.loadtxt(
+        light_path, usecols=range(6), unpack=True
+    )
+    light_mask = light_data[0] <= LHAASO_PLOT_EMAX
+    lhaaso_data["light"] = tuple(
+        values[light_mask] for values in light_data
+    )
+
+    lower = EXTRAPOLATION_PLOT_EMIN
+    energy = np.logspace(
+        np.log10(lower), np.log10(LHAASO_PLOT_EMAX), 450
+    )
+    scale = energy ** PLOT_SLOPE
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(13, 17), sharex=True,
+        layout="constrained",
+    )
+
+    panel_info = (
+        ("H", "H", SPECIES_COLORS["H"]),
+        ("He", "He", SPECIES_COLORS["He"]),
+        ("light", "H+He", "tab:purple"),
+    )
+    for ax, (observable, panel_label, color) in zip(axes, panel_info):
+        if observable == "light":
+            curves = np.asarray([
+                species_model(samples[i], "H", energy)
+                + species_model(samples[i], "He", energy)
+                for i in idx
+            ])
+            datasets = (
+                (
+                    "LHAASO QGSJET-II-04",
+                    lhaaso_data["light"],
+                    color,
+                    "o",
+                ),
+            )
+        else:
+            curves = np.asarray([
+                species_model(samples[i], observable, energy) for i in idx
+            ])
+            datasets = (
+                ("DAMPE", dampe_data[observable], "0.45", "s"),
+                (
+                    "LHAASO QGSJET-II-04",
+                    lhaaso_data[observable],
+                    color,
+                    "o",
+                ),
+            )
+        lo95, lo68, median, up68, up95 = np.percentile(
+            curves, [2.5, 16.0, 50.0, 84.0, 97.5], axis=0
+        )
+        ax.fill_between(
+            energy, lo95 * scale, up95 * scale,
+            color=color, alpha=0.08, lw=0.0,
+        )
+        ax.fill_between(
+            energy, lo68 * scale, up68 * scale,
+            color=color, alpha=0.20, lw=0.0,
+        )
+        ax.plot(
+            energy, median * scale, color=color, lw=3.2,
+            label="direct-fit posterior",
+        )
+
+        for label, dataset, data_color, marker in datasets:
+            e, y, stat_lo, stat_up, sys_lo, sys_up = dataset
+            data_scale = e ** PLOT_SLOPE
+            y_plot = y * data_scale
+            sys_bottom = (y - sys_lo) * data_scale
+            sys_top = (y + sys_up) * data_scale
+            ax.vlines(
+                e, sys_bottom, sys_top,
+                color=data_color, linewidth=1.2, linestyles=":",
+                alpha=0.9, zorder=3,
+            )
+            ax.plot(
+                e, sys_bottom, ls="", marker="_", markersize=7,
+                markeredgewidth=1.2, color=data_color, zorder=3,
+            )
+            ax.plot(
+                e, sys_top, ls="", marker="_", markersize=7,
+                markeredgewidth=1.2, color=data_color, zorder=3,
+            )
+            ax.errorbar(
+                e, y_plot,
+                yerr=[stat_lo * data_scale, stat_up * data_scale],
+                fmt=marker, markersize=7,
+                markerfacecolor="white", markeredgecolor=data_color,
+                markeredgewidth=1.5, color=data_color,
+                elinewidth=1.4, capsize=3.0, capthick=1.4,
+                zorder=4, label=label,
+            )
+
+        ax.axvspan(
+            EXTRAPOLATION_START, LHAASO_PLOT_EMAX,
+            color="0.5", alpha=0.06, zorder=0,
+        )
+        ax.axvline(
+            EXTRAPOLATION_START, color="0.35", lw=1.5, ls="--", zorder=1,
+        )
+        ax.text(
+            0.97, 0.92, panel_label,
+            transform=ax.transAxes, ha="right", va="top",
+            color=color, fontsize=24,
+        )
+        ax.text(
+            EXTRAPOLATION_START * 1.08, 0.08,
+            "extrapolation",
+            transform=ax.get_xaxis_transform(),
+            color="0.35", fontsize=15,
+        )
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlim(lower, LHAASO_PLOT_EMAX)
+
+    axes[0].legend(loc="lower left", fontsize=17)
+    axes[-1].set_xlabel(r"$E$ [GeV]")
+    fig.supylabel(
+        rf"$E^{{{PLOT_SLOPE:g}}} I_s(E)$ "
+        rf"[GeV$^{{{PLOT_SLOPE - 1.0:g}}}$ "
+        r"m$^{-2}$ s$^{-1}$ sr$^{-1}$]"
+    )
+    savefig(fig, "EVA_mcmc_direct_lhaaso_extrapolation.pdf")
+
+
 def main():
     d = np.load(OUTPUT, allow_pickle=False)
     plot_reconstruction(d)
+    plot_lhaaso_extrapolation(d)
     plot_breaks(d["samples"])
-    report_break_differences(d["samples"])
-    plot_break_differences(d["samples"])
     plot_slopes_2d(d["samples"])
     plot_alpha1_break_2d(d["samples"])
 

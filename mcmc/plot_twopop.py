@@ -3,11 +3,14 @@
 Reads ``output/EVA_mcmc_twopop.npz`` from :mod:`mcmc_twopop` and creates:
 
     figures/EVA_mcmc_twopop_spectrum.pdf
+    figures/EVA_mcmc_twopop_allparticle_lnA.pdf
     figures/EVA_mcmc_twopop_corner.pdf
 
 The spectrum figure has one panel per species.  The total LE+HE posterior is
 shown with median, 68%, and 95% credible regions.  LE and HE median components
-are overlaid separately.  Statistical data errors are solid capped bars;
+are overlaid separately.  The derived-observables figure shows the posterior
+for the sum of all modeled species and the corresponding flux-weighted
+average logarithmic mass.  Statistical data errors are solid capped bars;
 systematic errors are dotted intervals.
 
 Run with:
@@ -48,6 +51,7 @@ FIGURES_DIR = os.path.join(
 )
 
 PLOT_SLOPE = 2.6
+ALLPARTICLE_PLOT_SLOPE = 2.7
 PLOT_EMAX = 3.0e7
 PLOT_YLIM = (6.0e1, 1.0e4)
 N_POSTERIOR_CURVES = 2000
@@ -67,6 +71,24 @@ SPECIES_COLORS = {
     "O": "tab:red",
     "Fe": "tab:purple",
 }
+DERIVED_DATASETS = (
+    {
+        "label": "LHAASO",
+        "allparticle": "LHAASO_QGSJET-II-04_allParticle_totalEnergy.txt",
+        "lnA": "LHAASO_QGSJET-II-04_lnA_totalEnergy.txt",
+        "color": "tab:blue",
+        "marker": "o",
+        "scale_experiment": "LHAASO",
+    },
+    {
+        "label": "KASCADE",
+        "allparticle": "KASCADE_Kuznetsov2024_allParticle_totalEnergy.txt",
+        "lnA": "KASCADE_Kuznetsov2024_lnA_totalEnergy.txt",
+        "color": "tab:red",
+        "marker": "^",
+        "scale_experiment": None,
+    },
+)
 
 
 def savefig(fig, filename, dpi=300):
@@ -192,6 +214,18 @@ def energy_grid(data, species, npoints=350):
     return np.logspace(np.log10(lower), np.log10(PLOT_EMAX), npoints)
 
 
+def derived_energy_grid(npoints=400):
+    """Energy grid where every modeled species is above the fit rigidity cut."""
+    lower = max(
+        np.sqrt(
+            (Z[species] * MIN_RIGIDITY) ** 2
+            + (A[species] * 0.938272) ** 2
+        )
+        for species in SPECIES
+    )
+    return np.logspace(np.log10(lower), np.log10(PLOT_EMAX), npoints)
+
+
 def draw_posterior(ax, samples, sample_idx, species, energy):
     le_curves = []
     he_curves = []
@@ -234,6 +268,41 @@ def draw_posterior(ax, samples, sample_idx, species, energy):
                 energy, he_median * scale, color=color,
                 lw=1.8, ls=":",
             )
+
+
+def derived_posterior_curves(samples, sample_idx, energy):
+    """Return all-particle and flux-weighted mean-lnA posterior curves."""
+    ln_mass = np.log([A[species] for species in SPECIES])[:, None]
+    allparticle_curves = []
+    lnA_curves = []
+
+    for i in sample_idx:
+        species_curves = np.asarray([
+            sum(species_components(samples[i], species, energy))
+            for species in SPECIES
+        ])
+        allparticle = np.sum(species_curves, axis=0)
+        allparticle_curves.append(allparticle)
+        lnA_curves.append(
+            np.sum(ln_mass * species_curves, axis=0) / allparticle
+        )
+
+    return np.asarray(allparticle_curves), np.asarray(lnA_curves)
+
+
+def draw_credible_band(ax, energy, curves, color, scale=1.0):
+    lo95, lo68, median, up68, up95 = np.percentile(
+        curves, [2.5, 16.0, 50.0, 84.0, 97.5], axis=0
+    )
+    ax.fill_between(
+        energy, lo95 * scale, up95 * scale,
+        color=color, alpha=0.12, lw=0.0,
+    )
+    ax.fill_between(
+        energy, lo68 * scale, up68 * scale,
+        color=color, alpha=0.28, lw=0.0,
+    )
+    ax.plot(energy, median * scale, color=color, lw=3.5, zorder=3)
 
 
 def draw_data(ax, data, samples, species):
@@ -315,6 +384,60 @@ def draw_kascade_fe(ax):
     )
 
 
+def load_derived_data(filename):
+    path = os.path.join(kiss_reader.KISS_TABLES_DIR, filename)
+    energy, value, stat_lo, stat_up, sys_lo, sys_up = np.loadtxt(
+        path, usecols=range(6), unpack=True
+    )
+    mask = energy <= PLOT_EMAX
+    return tuple(
+        array[mask]
+        for array in (energy, value, stat_lo, stat_up, sys_lo, sys_up)
+    )
+
+
+def draw_derived_data(ax, dataset, quantity, samples):
+    energy, value, stat_lo, stat_up, sys_lo, sys_up = (
+        load_derived_data(dataset[quantity])
+    )
+    scales = median_scales(samples)
+    factor = scales.get(dataset["scale_experiment"], 1.0)
+    energy = factor * energy
+
+    if quantity == "allparticle":
+        plot_scale = energy ** ALLPARTICLE_PLOT_SLOPE / factor
+        value = value * plot_scale
+        stat_lo = stat_lo * plot_scale
+        stat_up = stat_up * plot_scale
+        sys_lo = sys_lo * plot_scale
+        sys_up = sys_up * plot_scale
+
+    color = dataset["color"]
+    sys_bottom = value - sys_lo
+    sys_top = value + sys_up
+    ax.vlines(
+        energy, sys_bottom, sys_top,
+        color=color, linewidth=1.1, linestyles=":",
+        alpha=0.9, zorder=4,
+    )
+    ax.plot(
+        energy, sys_bottom, ls="", marker="_", markersize=6,
+        markeredgewidth=1.1, color=color, zorder=4,
+    )
+    ax.plot(
+        energy, sys_top, ls="", marker="_", markersize=6,
+        markeredgewidth=1.1, color=color, zorder=4,
+    )
+    ax.errorbar(
+        energy, value, yerr=[stat_lo, stat_up],
+        fmt=dataset["marker"], markersize=5.5,
+        markerfacecolor="white", markeredgecolor=color,
+        markeredgewidth=1.3, color=color,
+        elinewidth=1.2, capsize=2.5, capthick=1.2,
+        zorder=5,
+    )
+
+
 def plot_spectrum(d, data):
     samples = d["samples"]
     sample_idx = posterior_indices(len(samples))
@@ -392,13 +515,86 @@ def plot_spectrum(d, data):
         savefig(fig, "EVA_mcmc_twopop_spectrum.pdf")
 
 
+def plot_derived_observables(d):
+    samples = d["samples"]
+    sample_idx = posterior_indices(len(samples))
+    energy = derived_energy_grid()
+    allparticle_curves, lnA_curves = derived_posterior_curves(
+        samples, sample_idx, energy
+    )
+
+    with plt.style.context(STYLE):
+        fig, (ax_flux, ax_lnA) = plt.subplots(
+            2, 1, figsize=(14, 15), sharex=True,
+            gridspec_kw={"height_ratios": (1.15, 1.0)},
+        )
+
+        color = "tab:purple"
+        draw_credible_band(
+            ax_flux, energy, allparticle_curves, color,
+            scale=energy ** ALLPARTICLE_PLOT_SLOPE,
+        )
+        draw_credible_band(ax_lnA, energy, lnA_curves, color)
+
+        for dataset in DERIVED_DATASETS:
+            draw_derived_data(
+                ax_flux, dataset, "allparticle", samples
+            )
+            draw_derived_data(ax_lnA, dataset, "lnA", samples)
+
+        ax_flux.set_xscale("log")
+        ax_flux.set_yscale("log")
+        ax_flux.set_xlim(energy[0], PLOT_EMAX)
+        ax_flux.set_ylabel(
+            r"$E^{2.7}\,I_{\rm all}(E)$ "
+            r"[GeV$^{1.7}$ m$^{-2}$ s$^{-1}$ sr$^{-1}$]"
+        )
+        ax_flux.set_title("All-particle spectrum")
+
+        ax_lnA.set_xscale("log")
+        ax_lnA.set_ylim(0.0, np.log(max(A.values())))
+        ax_lnA.set_xlabel(r"$E$ [GeV]")
+        ax_lnA.set_ylabel(r"$\langle \ln A \rangle$")
+        ax_lnA.set_title("Mean logarithmic mass")
+
+        handles = [
+            Line2D(
+                [], [], color=color, lw=3.5,
+                label=r"model posterior (H+He+C+O+Fe)",
+            ),
+        ]
+        handles.extend(
+            Line2D(
+                [], [], ls="", marker=dataset["marker"], markersize=7,
+                markerfacecolor="white",
+                markeredgecolor=dataset["color"],
+                markeredgewidth=1.4, label=dataset["label"],
+            )
+            for dataset in DERIVED_DATASETS
+        )
+        handles.extend([
+            Line2D(
+                [], [], ls="", marker="_", markersize=9,
+                markeredgewidth=1.3, color="0.3", label="statistical",
+            ),
+            Line2D(
+                [], [], ls=":", marker="_", markersize=7,
+                markeredgewidth=1.1, lw=1.1,
+                color="0.4", label="systematic",
+            ),
+        ])
+        ax_flux.legend(handles=handles, loc="lower left", fontsize=16, ncol=2)
+
+        savefig(fig, "EVA_mcmc_twopop_allparticle_lnA.pdf")
+
+
 def plot_corner(d):
     try:
         import corner
     except ImportError as exc:
         raise RuntimeError(
             "the 'corner' package is required for the corner plot; install it "
-            "or run with --only spectrum"
+            "or run with --only spectrum/derived"
         ) from exc
 
     labels = list(d["labels"])
@@ -430,7 +626,7 @@ def parse_args():
     )
     parser.add_argument(
         "--only",
-        choices=("all", "spectrum", "corner"),
+        choices=("all", "spectrum", "derived", "corner"),
         default="all",
         help="select which figure to generate",
     )
@@ -445,6 +641,8 @@ def main():
     if args.only in ("all", "spectrum"):
         data = reload_and_validate_data(d)
         plot_spectrum(d, data)
+    if args.only in ("all", "derived"):
+        plot_derived_observables(d)
     if args.only in ("all", "corner"):
         plot_corner(d)
 
